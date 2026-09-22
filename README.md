@@ -148,6 +148,113 @@ curl -s -X POST http://localhost:8000/normalize \
 `end_ms <= start_ms`、`start_ms < 0`、`min_gap_ms < 0` 等返回 FastAPI 标准
 `422 Unprocessable Entity` 校验错误。
 
+### `POST /normalize-document`
+
+直接接收整份 **SRT** 或 **WebVTT** 文档，按文档中的 cue 顺序调用同一个时间轴求解器，
+返回同格式的 `normalized_content` 与总位移。
+
+**只修改 cue 时间行上的两个时间戳**，其余内容与顺序原样保留：
+
+- SRT：编号（即使不连续/补零）、一行或多行 cue 文本；
+- WebVTT：`WEBVTT` 文件头及其标题、`NOTE`/`STYLE`/`REGION` 块、cue 标识行、
+  时间行末尾的 settings（如 `align:start position:20%`）；
+- 两种格式的换行风格（`\n` / `\r\n`）、行首缩进、时间戳分隔符（`,`/`.`）均保持一致。
+
+请求体：
+
+| 字段 | 类型 | 必填 | 约束 / 说明 |
+| --- | --- | --- | --- |
+| `format` | `string` | 是 | `"srt"` 或 `"webvtt"` |
+| `content` | `string` | 是 | 原始文档全文（允许空 SRT 或仅有头部的 WebVTT） |
+| `min_gap_ms` | `integer` | 是 | 相邻 cue 最小间隔（毫秒），`>= 0` |
+| `pinned_indices` | `array<integer>` | 否 | 需要锁定的 cue 的 **0 基下标**（按文档中 cue 的出现顺序，头部与 `NOTE`/`STYLE`/`REGION` 块不计号），不可重复、不可为负 |
+
+#### 成功响应（200）
+
+SRT 示例（命令行里用文件传入可避免手工转义）：
+
+```bash
+cat > subtitles.srt <<'EOF'
+1
+00:00:00,000 --> 00:00:01,000
+Hello
+world
+
+2
+00:00:00,500 --> 00:00:02,000
+Middle
+
+3
+00:00:00,600 --> 00:00:03,000
+Bye
+EOF
+
+curl -s -X POST http://localhost:8000/normalize-document \
+  -H 'Content-Type: application/json' \
+  -d "$(python3 -c 'import json;print(json.dumps({"format":"srt","content":open("subtitles.srt").read(),"min_gap_ms":0}))')"
+```
+
+```json
+{
+  "format": "srt",
+  "normalized_content": "1\n00:00:00,000 --> 00:00:01,000\nHello\nworld\n\n2\n00:00:01,000 --> 00:00:02,500\nMiddle\n\n3\n00:00:02,500 --> 00:00:04,900\nBye\n",
+  "cue_count": 3,
+  "min_gap_ms": 0,
+  "total_absolute_displacement_ms": 2400
+}
+```
+
+编号与多行文本保持不变，只有两个重叠 cue 的时间戳被推后。把第 1 条 cue 锁定只需
+加 `"pinned_indices": [0]`（锁定位置必须容得下其前后所有 cue，否则返回 409）。
+
+WebVTT 示例（文件头、`NOTE`/`REGION`、cue 标识、settings 全部原样保留）：
+
+```bash
+curl -s -X POST http://localhost:8000/normalize-document \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "format": "webvtt",
+    "min_gap_ms": 0,
+    "content": "WEBVTT - demo\n\nNOTE keep me\n\nREGION\nid:top\n\ncue-a\n00:00.000 --> 00:01.000 line:0\nHello\n\n00:00.500 --> 00:02.000\nMiddle\n"
+  }'
+```
+
+```json
+{
+  "format": "webvtt",
+  "normalized_content": "WEBVTT - demo\n\nNOTE keep me\n\nREGION\nid:top\n\ncue-a\n00:00.000 --> 00:01.000 line:0\nHello\n\n00:01.000 --> 00:02.500\nMiddle\n",
+  "cue_count": 2,
+  "min_gap_ms": 0,
+  "total_absolute_displacement_ms": 500
+}
+```
+
+> 时间戳按原文风格写回（SRT 长格式 `HH:MM:SS,mmm`，WebVTT 长格式或短格式
+> `MM:SS.mmm`）；若短格式时间戳被推移到 1 小时之后，会自动提升为长格式以保证合法。
+
+#### 语法错误（422）
+
+文档不符合 SRT/WebVTT 语法（缺少 `WEBVTT` 头、时间行无法解析、缺少编号行等）时
+返回 `422`，`line` 为**从 1 开始、包含空行与文件头**的行号：
+
+```json
+{
+  "error": "document_syntax_error",
+  "format": "srt",
+  "line": 6,
+  "message": "expected the SRT timing line ('-->') after the cue number"
+}
+```
+
+`pinned_indices` 超出 cue 数量时同样返回 `422`
+（`error` 为 `invalid_pinned_indices`，并给出越界下标与 `cue_count`）；
+`format` 取值非法、`min_gap_ms < 0`、下标为负或重复则返回 FastAPI 标准校验错误。
+
+#### 求解冲突（409）
+
+锁定 cue（`pinned_indices`）之间无法同时满足时，沿用 `/normalize` 的
+`409 Conflict`，`conflicts[].from_index` / `to_index` 同样是 cue 的 0 基下标。
+
 ## 算法说明
 
 令片段 `i` 的时长为 `d_i`，定义累计常量 `c_0 = 0`、
@@ -167,9 +274,10 @@ y_i = x_i - c_i,   t_i = a_i - c_i
 
 ```
 app/
-  main.py       # FastAPI 路由：/、/health、POST /normalize
+  main.py       # FastAPI 路由：/、/health、POST /normalize、POST /normalize-document
   schemas.py    # Pydantic v2 请求/响应模型与输入校验
   solver.py     # 核心求解器（可行性检查 + L1 保序回归 PAVA）
+  documents.py  # SRT / WebVTT 解析与只改时间戳的无损重建
   tests/        # pytest 单元/接口测试（含暴力 DP 最优性随机校验）
 Dockerfile
 docker-compose.yml
