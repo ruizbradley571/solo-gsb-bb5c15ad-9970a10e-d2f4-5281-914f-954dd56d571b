@@ -51,7 +51,7 @@ pytest -q                              # 运行测试
 健康检查，返回 `200`：
 
 ```json
-{ "status": "ok", "version": "1.0.0" }
+{ "status": "ok", "version": "1.1.0" }
 ```
 
 ### `POST /normalize`
@@ -148,6 +148,98 @@ curl -s -X POST http://localhost:8000/normalize \
 `end_ms <= start_ms`、`start_ms < 0`、`min_gap_ms < 0` 等返回 FastAPI 标准
 `422 Unprocessable Entity` 校验错误。
 
+### `POST /normalize-document`
+
+与 `/normalize` 使用同一求解器，但直接接收**整个字幕文件文本**，按文档中 cue
+的出现顺序求解，返回**只改写了 cue 时间戳**的同格式文档：
+
+- SRT：编号、多行文本、时间行其余内容（如 `X1:.. X2:..` 坐标）原样保留；
+- WebVTT：`WEBVTT` 头、`NOTE` / `STYLE` / `REGION` 块、cue 标识、时间行
+  settings（如 `align:start position:0%`）原样保留；
+- 空行与换行风格（LF / CRLF）逐字节保留；
+- 文档语法错误返回 `422` 并给出**行号**；约束冲突与 `/normalize` 一样返回 `409`。
+
+请求体：
+
+| 字段 | 类型 | 必填 | 约束 / 说明 |
+| --- | --- | --- | --- |
+| `format` | `string` | 是 | `"srt"` 或 `"webvtt"` |
+| `content` | `string` | 是 | 完整字幕文件文本 |
+| `min_gap_ms` | `integer` | 否 | 相邻 cue 最小间隔（毫秒），`>= 0`，默认 `0` |
+| `pinned_indices` | `integer[]` | 否 | 锁定 cue 的 **0 基下标**（按文档中 cue 的出现顺序），默认 `[]` |
+
+#### 成功响应（200）
+
+```bash
+curl -s -X POST http://localhost:8000/normalize-document \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "format": "srt",
+    "content": "1\n00:00:01,000 --> 00:00:02,000\n你好\n\n2\n00:00:01,500 --> 00:00:03,000\n世界\n"
+  }'
+```
+
+```json
+{
+  "format": "srt",
+  "normalized_content": "1\n00:00:00,500 --> 00:00:01,500\n你好\n\n2\n00:00:01,500 --> 00:00:03,000\n世界\n",
+  "min_gap_ms": 0,
+  "cue_count": 2,
+  "total_absolute_displacement_ms": 500
+}
+```
+
+WebVTT 与锁定 cue（`pinned_indices`）示例：
+
+```bash
+curl -s -X POST http://localhost:8000/normalize-document \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "format": "webvtt",
+    "pinned_indices": [0],
+    "content": "WEBVTT\n\nNOTE 片头注释\n\nintro\n00:00.000 --> 00:01.000 align:start\n你好\n\n00:00.500 --> 00:02.000\n世界\n"
+  }'
+```
+
+```json
+{
+  "format": "webvtt",
+  "normalized_content": "WEBVTT\n\nNOTE 片头注释\n\nintro\n00:00.000 --> 00:01.000 align:start\n你好\n\n00:01.000 --> 00:02.500\n世界\n",
+  "min_gap_ms": 0,
+  "cue_count": 2,
+  "total_absolute_displacement_ms": 500
+}
+```
+
+> 实际使用中可用 `jq` 直接读取文件并写回结果：
+>
+> ```bash
+> jq -n --arg c "$(cat subs.srt)" '{format:"srt", content:$c, min_gap_ms:80}' \
+>   | curl -s -X POST http://localhost:8000/normalize-document \
+>       -H 'Content-Type: application/json' -d @- \
+>   | jq -r .normalized_content > subs.fixed.srt
+> ```
+
+#### 文档语法错误（422）
+
+SRT 编号缺失、时间行格式错误、WebVTT 缺少 `WEBVTT` 头、cue 时长非正等均返回
+`422`，`line` 为 **1 基行号**：
+
+```json
+{
+  "error": "document_syntax_error",
+  "message": "malformed timing line: expected 'HH:MM:SS,mmm --> HH:MM:SS,mmm'",
+  "line": 6
+}
+```
+
+`pinned_indices` 越界时同样返回 `422`，`error` 为 `invalid_pinned_indices`。
+
+#### 约束无解（409）
+
+与 `/normalize` 完全相同的响应结构；`from_index` / `to_index` 为文档中 cue 的
+0 基下标，`from_id` / `to_id` 为 SRT 编号或 WebVTT cue 标识（无标识时为 `null`）。
+
 ## 算法说明
 
 令片段 `i` 的时长为 `d_i`，定义累计常量 `c_0 = 0`、
@@ -167,9 +259,10 @@ y_i = x_i - c_i,   t_i = a_i - c_i
 
 ```
 app/
-  main.py       # FastAPI 路由：/、/health、POST /normalize
+  main.py       # FastAPI 路由：/、/health、POST /normalize、POST /normalize-document
   schemas.py    # Pydantic v2 请求/响应模型与输入校验
   solver.py     # 核心求解器（可行性检查 + L1 保序回归 PAVA）
+  documents.py  # SRT / WebVTT 解析与“只改时间戳”的重渲染
   tests/        # pytest 单元/接口测试（含暴力 DP 最优性随机校验）
 Dockerfile
 docker-compose.yml

@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import List, Optional
+from enum import Enum
+from typing import Annotated, List, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -93,3 +94,60 @@ class ConflictResponse(BaseModel):
     error: str = Field(..., examples=["infeasible_constraints"])
     message: str
     conflicts: List[ConflictOutput]
+
+
+# --------------------------------------------------------------------------- #
+# POST /normalize-document
+# --------------------------------------------------------------------------- #
+
+
+class DocumentFormat(str, Enum):
+    """Subtitle container formats accepted by /normalize-document."""
+
+    srt = "srt"
+    webvtt = "webvtt"
+
+
+class NormalizeDocumentRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    format: DocumentFormat = Field(..., description="Subtitle document format.")
+    content: str = Field(..., description="The full subtitle document text.")
+    min_gap_ms: int = Field(
+        default=0,
+        ge=0,
+        description="Required gap in milliseconds between consecutive cues.",
+    )
+    pinned_indices: List[Annotated[int, Field(ge=0)]] = Field(
+        default_factory=list,
+        description=(
+            "0-based indices (in document cue order) of cues that must not move."
+        ),
+    )
+
+
+class NormalizeDocumentResponse(BaseModel):
+    format: DocumentFormat
+    normalized_content: str = Field(
+        ...,
+        description=(
+            "The document with only cue timestamps rewritten; all other "
+            "content and the newline style are byte-identical to the input."
+        ),
+    )
+    min_gap_ms: int
+    cue_count: int = Field(..., description="Number of cues found in the document.")
+    total_absolute_displacement_ms: int = Field(
+        ...,
+        description="Sum of |new start - original start| over all cues; the minimized value.",
+    )
+
+
+class DocumentErrorResponse(BaseModel):
+    """Body returned with HTTP 422 when the document itself is invalid."""
+
+    error: str = Field(..., examples=["document_syntax_error"])
+    message: str
+    line: Optional[int] = Field(
+        None, description="1-based line number of the problem, when applicable."
+    )
